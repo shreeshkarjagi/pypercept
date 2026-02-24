@@ -1,4 +1,4 @@
-# perceptlfp
+# pypercept
 
 Analysis toolkit for Medtronic Percept PC/RC Local Field Potential (LFP) data.
 
@@ -20,14 +20,14 @@ Loads JSON session reports exported from the Percept programmer, runs standard s
 pip install numpy scipy pandas matplotlib
 ```
 
-Then either install as a package or just drop the `perceptlfp/` folder next to your scripts.
+Then either install as a package or just drop the `pypercept/` folder next to your scripts.
 
 ## Quick start
 
 ### Load and process a single session
 
 ```python
-import perceptlfp as lfp
+import pypercept as lfp
 
 # simple load --> returns Session object ready for processing
 session = lfp.load_session("Report_Session_20251014.json")
