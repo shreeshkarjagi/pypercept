@@ -20,7 +20,7 @@ Loads JSON session reports exported from the Percept programmer, runs standard s
 pip install numpy scipy pandas matplotlib
 ```
 
-Then either install as a package or just drop the `pypercept/` folder next to your scripts.
+drop the `pypercept/` folder next to your scripts.
 
 ## Quick start
 
