@@ -111,7 +111,7 @@ good_epochs = lfp.reject_bad_epochs(epochs, threshold=500)
 ### Plotting
 
 ```python
-lfp.set_style()  # sets Nature Medicine-ish matplotlib defaults
+lfp.set_style()  # set matplotlib defaults
 
 # PSD plot
 freqs, psd = lfp.compute_psd(clean, fs)
