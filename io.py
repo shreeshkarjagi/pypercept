@@ -68,19 +68,33 @@ class StreamingData:
 
 @dataclass
 class BrainSenseLfpData:
-    """Device-computed LFP power snapshots (companion to BrainSenseTimeDomain)."""
+    """Device-computed LFP power snapshots (companion to BrainSenseTimeDomain).
+
+    One instance per (session, hemisphere). A session here = one entry in the
+    top-level `BrainSenseLfp` list, identified by its `FirstPacketDateTime`.
+    """
 
     hemisphere: str
     ticks_in_ms: np.ndarray
     lfp_power: np.ndarray
     stim_amplitude: np.ndarray
+    sample_rate: float = 2.0                 # BrainSenseLfp is typically 2 Hz
     frequency_band: Optional[float] = None
     therapy_snapshot: Optional[Dict] = None
     first_packet_datetime: Optional[str] = None
+    trial_number: Optional[int] = None
 
     @property
     def n_samples(self) -> int:
         return len(self.lfp_power)
+
+    @property
+    def time_vector(self) -> np.ndarray:
+        """Seconds since the first sample, derived from TicksInMs (rollover-corrected)."""
+        if self.ticks_in_ms is None or len(self.ticks_in_ms) == 0:
+            return np.array([])
+        t = _handle_tick_rollover(np.asarray(self.ticks_in_ms, dtype=np.float64))
+        return (t - t[0]) / 1000.0
 
     def __repr__(self) -> str:
         return f"BrainSenseLfpData('{self.hemisphere}', {self.n_samples} samples)"
@@ -184,6 +198,51 @@ class PerceptSession:
             return None
         aligned_idx = align_by_ticks(stream.ticks_in_ms, lfp.ticks_in_ms)
         return stream, lfp, aligned_idx
+
+    def get_sessions(self) -> List[Dict[str, Any]]:
+        """
+        Group BrainSenseTimeDomain + BrainSenseLfp into one dict per session.
+        Each entry looks like:
+
+            {"datetime": "...Z", "trial_number": 1,
+             "td":  {"left": StreamingData|None, "right": StreamingData|None},
+             "lfp": {"left": BrainSenseLfpData|None,
+                     "right": BrainSenseLfpData|None}}
+
+        Matching prefers `trial_number` (assigned by the 60 s-gap rule in
+        `_assign_trial_numbers`) over raw timestamp equality, because TD and
+        LFP blocks for the same trial can differ by ~1 s in their
+        FirstPacketDateTime fields.
+        """
+        sessions: Dict[Any, Dict[str, Any]] = {}
+
+        def _key(item, prefix):
+            if item.trial_number is not None:
+                return ("trial", item.trial_number)
+            return (prefix, item.first_packet_datetime or id(item))
+
+        def _bucket(key, dt, trial):
+            return sessions.setdefault(key, {
+                "datetime": dt,
+                "trial_number": trial,
+                "td": {"left": None, "right": None},
+                "lfp": {"left": None, "right": None},
+            })
+
+        for s in self.brainsense_timedomain:
+            sess = _bucket(_key(s, "td"), s.first_packet_datetime, s.trial_number)
+            if s.hemisphere in sess["td"]:
+                sess["td"][s.hemisphere] = s
+
+        for l in self.brainsense_lfp:
+            sess = _bucket(_key(l, "lfp"), l.first_packet_datetime, l.trial_number)
+            if l.hemisphere in sess["lfp"]:
+                sess["lfp"][l.hemisphere] = l
+
+        return sorted(
+            sessions.values(),
+            key=lambda s: (s["trial_number"] is None, s["trial_number"], s["datetime"] or ""),
+        )
 
     def has_indefinite_streaming(self) -> bool:
         return len(self.indefinite_streaming) > 0
@@ -376,56 +435,80 @@ def _extract_brainsense_timedomain(data: Dict) -> List[StreamingData]:
     return result
 
 
+# LFP sentinel returned by the device for "no valid reading" (0xFFFFFFFF).
+_LFP_INVALID_SENTINEL = 4294967295
+
+
 def _extract_brainsense_lfp(data: Dict) -> List[BrainSenseLfpData]:
     """
-    Extract BrainSenseLfp: device-computed LFP power that accompanies
-    BrainSenseTimeDomain. Needs tick-based alignment with the time-domain data.
+    Extract BrainSenseLfp: device-computed LFP power + stim amplitude that
+    accompanies BrainSenseTimeDomain.
+
+    Each entry in the top-level `BrainSenseLfp` list is one *session* with
+    its own `FirstPacketDateTime` and a per-tick `LfpData` list:
+
+        { "FirstPacketDateTime": ..., "SampleRateInHz": 2,
+          "TherapySnapshot": {...},
+          "LfpData": [
+              {"TicksInMs": 2430150,
+               "Left":  {"LFP": 1053, "mA": 6},
+               "Right": {"LFP": 3691, "mA": 6}},
+              ... ] }
+
+    We emit one BrainSenseLfpData per (session, hemisphere), preserving session
+    identity via `first_packet_datetime` and `trial_number` so callers can
+    pair it with the matching BrainSenseTimeDomain streams.
     """
     if "BrainSenseLfp" not in data:
         return []
 
-    lfp_list = data["BrainSenseLfp"]
+    lfp_list = _assign_trial_numbers(list(data["BrainSenseLfp"]), "FirstPacketDateTime")
     logger.info(f"Found {len(lfp_list)} BrainSenseLfp entries")
 
-    # aggregate by hemisphere
-    hemi_data = {
-        "left": {"ticks": [], "lfp": [], "stim": [], "freq": None, "therapy": None, "datetime": None},
-        "right": {"ticks": [], "lfp": [], "stim": [], "freq": None, "therapy": None, "datetime": None},
-    }
-
+    result: List[BrainSenseLfpData] = []
     for entry in lfp_list:
-        lfp_data = entry.get("LfpData", {})
+        records = entry.get("LfpData") or []
+        if not isinstance(records, list) or not records:
+            continue
 
-        for side, key in [("left", "Left"), ("right", "Right")]:
-            if key in lfp_data:
-                d = lfp_data[key]
-                hemi_data[side]["ticks"].append(d.get("TicksInMs", 0))
-                hemi_data[side]["lfp"].append(d.get("LFP", 0))
-                hemi_data[side]["stim"].append(d.get("mA", 0))
-                if hemi_data[side]["freq"] is None and "Frequency" in d:
-                    hemi_data[side]["freq"] = d.get("Frequency")
+        fs = float(entry.get("SampleRateInHz", 2.0))
+        dt = entry.get("FirstPacketDateTime", "")
+        therapy = entry.get("TherapySnapshot")
+        trial = entry.get("_trial_number")
 
-        # grab therapy snapshot from first entry
-        for side in ["left", "right"]:
-            if hemi_data[side]["therapy"] is None:
-                hemi_data[side]["therapy"] = entry.get("TherapySnapshot")
-                hemi_data[side]["datetime"] = entry.get("DateTime")
+        for side, key in (("left", "Left"), ("right", "Right")):
+            ticks, lfp, stim = [], [], []
+            for rec in records:
+                hd = rec.get(key)
+                if not isinstance(hd, dict):
+                    continue
+                ticks.append(rec.get("TicksInMs", 0))
+                lfp.append(hd.get("LFP", 0))
+                stim.append(hd.get("mA", 0))
 
-    result = []
-    for hemi in ["left", "right"]:
-        hd = hemi_data[hemi]
-        if hd["ticks"]:
+            if not ticks:
+                continue
+
+            lfp_arr = np.asarray(lfp, dtype=np.float64)
+            lfp_arr[lfp_arr == _LFP_INVALID_SENTINEL] = np.nan
+
+            hemi_therapy = therapy.get(key) if isinstance(therapy, dict) else None
+
             result.append(BrainSenseLfpData(
-                hemisphere=hemi,
-                ticks_in_ms=np.array(hd["ticks"], dtype=np.float64),
-                lfp_power=np.array(hd["lfp"], dtype=np.float64),
-                stim_amplitude=np.array(hd["stim"], dtype=np.float64),
-                frequency_band=hd["freq"],
-                therapy_snapshot=hd["therapy"],
-                first_packet_datetime=hd["datetime"],
+                hemisphere=side,
+                ticks_in_ms=np.asarray(ticks, dtype=np.float64),
+                lfp_power=lfp_arr,
+                stim_amplitude=np.asarray(stim, dtype=np.float64),
+                sample_rate=fs,
+                therapy_snapshot=hemi_therapy,
+                first_packet_datetime=dt,
+                trial_number=trial,
             ))
 
-    logger.info(f"BrainSenseLfp: {[f'{l.hemisphere}={l.n_samples}' for l in result]}")
+    logger.info(
+        "BrainSenseLfp parsed: "
+        + ", ".join(f"{l.hemisphere}@{l.first_packet_datetime}={l.n_samples}" for l in result)
+    )
     return result
 
 
@@ -560,3 +643,137 @@ def load_session_simple(filepath: Union[str, Path], source: str = "indefinite") 
     >>> result = process_session(session)
     """
     return percept_to_session(load_session(filepath), source=source)
+
+
+# ── BrainSense export ──────────────────────────────────────────────────────
+
+def export_brainsense(
+    filepath: Union[str, Path],
+    outdir: Union[str, Path, None] = None,
+) -> List[Path]:
+    """
+    Load a Percept JSON and export per-trial BrainSense data to CSV + PKL.
+
+    For each trial writes three files:
+      - ``{stem}_trial{N}_td.csv``   — raw time-domain waveform at 250 Hz,
+        columns: ``time_s``, ``left_uV``, ``right_uV``
+      - ``{stem}_trial{N}_lfp.csv``  — device-computed LFP power + stim mA
+        at 2 Hz, columns: ``time_s``, ``left_lfp``, ``left_stim_mA``,
+        ``right_lfp``, ``right_stim_mA``
+      - ``{stem}_trial{N}.pkl``      — full trial bundle dict with both
+        streams, metadata, and tick arrays for alignment.
+
+    Parameters
+    ----------
+    filepath : path to a Percept JSON that contains BrainSenseTimeDomain.
+    outdir   : directory for output files.  Defaults to the same directory
+               as the input JSON.
+
+    Returns
+    -------
+    List of Path objects for all files written.
+
+    Example
+    -------
+    >>> from pypercept.io import export_brainsense
+    >>> written = export_brainsense("Report_BaselineEEG_20240403.json")
+    """
+    import pickle
+
+    filepath = Path(filepath)
+    session = load_session(filepath)
+    trials = session.get_sessions()
+
+    if not trials:
+        logger.warning(f"No BrainSense sessions in {filepath.name}")
+        return []
+
+    if outdir is None:
+        outdir = filepath.parent
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = filepath.stem
+
+    written: List[Path] = []
+    for sess in trials:
+        trial_num = sess["trial_number"] or 0
+        td_l, td_r = sess["td"]["left"], sess["td"]["right"]
+        lfp_l, lfp_r = sess["lfp"]["left"], sess["lfp"]["right"]
+
+        # ── CSV 1: raw time-domain waveform at 250 Hz ──────────────
+        td_ref = td_l or td_r
+        if td_ref is not None:
+            td_data: Dict[str, Any] = {"time_s": td_ref.time_vector}
+            if td_l is not None:
+                td_data["left_uV"] = td_l.data
+            if td_r is not None:
+                td_data["right_uV"] = td_r.data
+
+            df_td = pd.DataFrame(td_data)
+            td_csv = outdir / f"{stem}_trial{trial_num}_td.csv"
+            df_td.to_csv(td_csv, index=False)
+            written.append(td_csv)
+            logger.info(f"Wrote {td_csv.name} ({len(df_td)} rows @ {td_ref.sample_rate} Hz)")
+
+        # ── CSV 2: LFP + stim at 2 Hz ─────────────────────────────
+        lfp_ref = lfp_l or lfp_r
+        if lfp_ref is not None:
+            lfp_data: Dict[str, Any] = {"time_s": lfp_ref.time_vector}
+            if lfp_l is not None:
+                lfp_data["left_lfp"] = lfp_l.lfp_power
+                lfp_data["left_stim_mA"] = lfp_l.stim_amplitude
+            if lfp_r is not None:
+                lfp_data["right_lfp"] = lfp_r.lfp_power
+                lfp_data["right_stim_mA"] = lfp_r.stim_amplitude
+
+            df_lfp = pd.DataFrame(lfp_data)
+            lfp_csv = outdir / f"{stem}_trial{trial_num}_lfp.csv"
+            df_lfp.to_csv(lfp_csv, index=False)
+            written.append(lfp_csv)
+            logger.info(f"Wrote {lfp_csv.name} ({len(df_lfp)} rows @ {lfp_ref.sample_rate} Hz)")
+
+        # ── PKL: full trial bundle ─────────────────────────────────
+        bundle = {
+            "filepath": str(filepath),
+            "session_date": session.session_date,
+            "trial_number": trial_num,
+            "datetime": sess["datetime"],
+            "td": {
+                "left": {
+                    "data": td_l.data,
+                    "time_s": td_l.time_vector,
+                    "fs": td_l.sample_rate,
+                    "channel": td_l.channel,
+                } if td_l else None,
+                "right": {
+                    "data": td_r.data,
+                    "time_s": td_r.time_vector,
+                    "fs": td_r.sample_rate,
+                    "channel": td_r.channel,
+                } if td_r else None,
+            },
+            "lfp": {
+                "left": {
+                    "lfp_power": lfp_l.lfp_power,
+                    "stim_mA": lfp_l.stim_amplitude,
+                    "time_s": lfp_l.time_vector,
+                    "fs": lfp_l.sample_rate,
+                    "ticks_ms": lfp_l.ticks_in_ms,
+                } if lfp_l else None,
+                "right": {
+                    "lfp_power": lfp_r.lfp_power,
+                    "stim_mA": lfp_r.stim_amplitude,
+                    "time_s": lfp_r.time_vector,
+                    "fs": lfp_r.sample_rate,
+                    "ticks_ms": lfp_r.ticks_in_ms,
+                } if lfp_r else None,
+            },
+        }
+
+        pkl_path = outdir / f"{stem}_trial{trial_num}.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(bundle, f)
+        written.append(pkl_path)
+        logger.info(f"Wrote {pkl_path.name}")
+
+    return written
