@@ -196,3 +196,35 @@ Percept uses contact pair names like `ZERO_THREE_LEFT` or `ONE_AND_THREE_RIGHT`.
 - **Bandpass**: 1–100 Hz, 4th order Butterworth
 - **PSD**: Welch's method, 256-sample segments, 50% overlap, linear detrend
 - **Artifact rejection**: ±500 µV threshold on epochs
+
+### Sensing channel impedance
+
+```python
+session = lfp.load_session("Report_Session_20251014.json")
+
+# auto-detect sensing config from Groups
+from pypercept.impedance import sensing_channel_impedance
+results = sensing_channel_impedance(session=session)
+
+for side, r in results.items():
+    print(f"{side} {r.sensing_pair}: {r.channel_impedance:.0f} ohms")
+    print(f"  type: {r.channel_type}, valid: {r.model_valid}")
+    if not r.model_valid:
+        print(f"  warnings: {r.validation_notes}")
+
+# override sensing config
+results = sensing_channel_impedance(session=session, sensing_pair=(0, 2))
+```
+
+Three config types are handled automatically based on whether each level in the
+sensing pair is a ring (levels 0, 3) or segmented (levels 1, 2 on SenSight leads):
+
+| Config type | Example | Method | Exact? |
+|---|---|---|---|
+| ring + ring | 0-3, any 1x4 pair | bipolar directly | yes |
+| ring + segments | 0-2, 1-3 | seg-to-seg decomposition + cross-level bipolars | validated via z_ring spread |
+| segments + segments | 1-2 | independent seg-to-seg decomposition per level | no cross-level estimation |
+
+The decomposition uses an additive contact model (`B_ij = z_i + z_j`) which is
+approximate. Results include a `model_valid` flag and `validation_notes` when the
+model doesn't fit (e.g. negative ring impedance or high spread between estimates).
