@@ -2,7 +2,7 @@
 
 Analysis toolkit for Medtronic Percept PC/RC Local Field Potential (LFP) data.
 
-Loads JSON session reports exported from the Percept programmer, runs standard spectral analysis, and generates publication-ready figures.
+Loads JSON session reports exported from the Percept programmer, runs standard spectral analysis, and generates figures.
 
 ## Supported data modalities
 
